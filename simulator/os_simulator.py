@@ -19,7 +19,7 @@ class OSSimulator:
         self.blocked: List[Process] = []
         self.finished: List[Process] = []
         self.running: Optional[Process] = None
-        self.memory = MemoryManager(frames=8)
+        self.memory = MemoryManager(frames=20)
         self.file_system = FileSystem()
         self.event_log: List[str] = []
         self.buffer_capacity = 3
@@ -394,6 +394,10 @@ class OSSimulator:
             "frames": self.memory.frame_table,
             "last_access": self.memory.last_access,
             "page_tables": {pid: proc.page_table for pid, proc in self.process_pool.items()},
+            "process_meta": {
+                pid: {"name": proc.name, "memory_pages": proc.memory_pages}
+                for pid, proc in self.process_pool.items()
+            },
             "files": self.file_system.files,
             "buffer": (self.buffer_count, self.buffer_capacity),
             "log": list(self.event_log),

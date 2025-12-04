@@ -1,3 +1,4 @@
+import math
 import tkinter as tk
 from tkinter import scrolledtext, ttk
 
@@ -13,6 +14,7 @@ class SimulatorGUI:
         self.auto_running = False
         self.selected_pid: int | None = None
         self.last_log_len = 0
+        self._color_cache: dict[int, str] = {}
 
         self._build_layout()
         self._render_snapshot()
@@ -67,24 +69,33 @@ class SimulatorGUI:
             box.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
             self.queue_boxes.append(box)
 
-        self.memory_tree = ttk.Treeview(left, columns=("frame", "page"), show="headings", height=8)
-        self.memory_tree.heading("frame", text="物理帧")
-        self.memory_tree.heading("page", text="占用(进程,页)")
-        self.memory_tree.column("frame", width=80)
-        self.memory_tree.column("page", width=160)
-        ttk.Label(left, text="存储 / 虚拟内存").pack(anchor=tk.W, pady=(8, 0))
-        self.memory_tree.pack(fill=tk.BOTH, expand=True)
+        mem_frame = ttk.LabelFrame(left, text="存储 / 虚拟内存")
+        mem_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
 
-        ttk.Label(left, text="页表 (虚存请求分页)").pack(anchor=tk.W, pady=(4, 0))
+        self.memory_info = ttk.Label(mem_frame, text="物理帧: 0 已用: 0 空闲: 0")
+        self.memory_info.pack(anchor=tk.W, padx=4, pady=(4, 0))
+
+        canvas_wrap = ttk.Frame(mem_frame)
+        canvas_wrap.pack(fill=tk.BOTH, expand=True, padx=4)
+        self.memory_canvas = tk.Canvas(canvas_wrap, height=220, background="#f7f7f7")
+        self.memory_canvas.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
+
+        side_bar = ttk.Frame(canvas_wrap)
+        side_bar.pack(side=tk.RIGHT, fill=tk.Y, padx=(6, 0))
+        ttk.Label(side_bar, text="空闲帧").pack(anchor=tk.W)
+        self.free_list = tk.Listbox(side_bar, height=6)
+        self.free_list.pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Label(side_bar, text="页表 (点击进程显示)").pack(anchor=tk.W)
         self.page_table_tree = ttk.Treeview(
-            left, columns=("proc", "page", "frame"), show="headings", height=6
+            side_bar, columns=("page", "frame", "status"), show="headings", height=8
         )
-        self.page_table_tree.heading("proc", text="进程")
         self.page_table_tree.heading("page", text="页号")
         self.page_table_tree.heading("frame", text="帧号")
-        self.page_table_tree.column("proc", width=80)
-        self.page_table_tree.column("page", width=60)
-        self.page_table_tree.column("frame", width=60)
+        self.page_table_tree.heading("status", text="状态")
+        self.page_table_tree.column("page", width=50, anchor=tk.CENTER)
+        self.page_table_tree.column("frame", width=60, anchor=tk.CENTER)
+        self.page_table_tree.column("status", width=90, anchor=tk.W)
         self.page_table_tree.pack(fill=tk.BOTH, expand=True)
 
         ttk.Label(right, text="文件管理").pack(anchor=tk.W)
@@ -105,6 +116,25 @@ class SimulatorGUI:
     def _clear_tree(self, tree: ttk.Treeview) -> None:
         for item in tree.get_children():
             tree.delete(item)
+
+    def _color_for_pid(self, pid: int) -> str:
+        if pid not in self._color_cache:
+            palette = [
+                "#c7e9c0",
+                "#a1d99b",
+                "#74c476",
+                "#31a354",
+                "#add8e6",
+                "#9ecae1",
+                "#6baed6",
+                "#4292c6",
+                "#fdd0a2",
+                "#fdae6b",
+                "#fd8d3c",
+                "#e6550d",
+            ]
+            self._color_cache[pid] = palette[len(self._color_cache) % len(palette)]
+        return self._color_cache[pid]
 
     def _render_processes(self, snapshot: dict) -> None:
         self._clear_tree(self.process_tree)
@@ -163,14 +193,34 @@ class SimulatorGUI:
                 box.insert(tk.END, f"P{proc.pid}({proc.current_quantum})")
 
     def _render_memory(self, snapshot: dict) -> None:
-        self._clear_tree(self.memory_tree)
-        for idx, cell in enumerate(snapshot["frames"]):
-            label = "空闲" if cell is None else f"P{cell[0]} 页{cell[1]}"
-            self.memory_tree.insert("", tk.END, values=(idx, label))
-        if snapshot["last_access"] is not None:
-            children = self.memory_tree.get_children()
-            if 0 <= snapshot["last_access"] < len(children):
-                self.memory_tree.selection_set(children[snapshot["last_access"]])
+        frames = snapshot["frames"]
+        used = len([f for f in frames if f is not None])
+        free = len(frames) - used
+        self.memory_info.configure(text=f"物理帧: {len(frames)} 已用: {used} 空闲: {free}")
+
+        # Draw memory grid similar to textbook paging diagrams.
+        self.memory_canvas.delete("all")
+        cols = max(4, math.ceil(math.sqrt(len(frames))))
+        cell_w, cell_h = 90, 42
+        pad = 6
+        for idx, cell in enumerate(frames):
+            row, col = divmod(idx, cols)
+            x1, y1 = col * (cell_w + pad), row * (cell_h + pad)
+            x2, y2 = x1 + cell_w, y1 + cell_h
+            fill = "#f1f1f1" if cell is None else self._color_for_pid(cell[0])
+            outline_width = 3 if snapshot["last_access"] == idx else 1
+            self.memory_canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline="#555", width=outline_width)
+            label = "空闲" if cell is None else f"P{cell[0]}.{cell[1]}"
+            self.memory_canvas.create_text((x1 + x2) / 2, (y1 + y2) / 2, text=label)
+            self.memory_canvas.create_text(x1 + 14, y1 + 12, text=str(idx), font=("TkDefaultFont", 8), fill="#333")
+
+        total_rows = math.ceil(len(frames) / cols)
+        self.memory_canvas.configure(scrollregion=(0, 0, cols * (cell_w + pad), total_rows * (cell_h + pad)))
+
+        self.free_list.delete(0, tk.END)
+        for idx, cell in enumerate(frames):
+            if cell is None:
+                self.free_list.insert(tk.END, idx)
 
         self._render_page_table(snapshot)
 
@@ -195,8 +245,14 @@ class SimulatorGUI:
         if pid is None:
             return
         table = snapshot["page_tables"].get(pid, {})
-        for page, frame in sorted(table.items()):
-            self.page_table_tree.insert("", tk.END, values=(pid, page, frame))
+        meta = snapshot.get("process_meta", {}).get(pid)
+        total_pages = meta.get("memory_pages") if meta else None
+        pages = range(total_pages) if total_pages is not None else sorted(table.keys())
+        for page in pages:
+            frame = table.get(page)
+            status = "驻留" if frame is not None else "未装入"
+            frame_text = frame if frame is not None else "-"
+            self.page_table_tree.insert("", tk.END, values=(page, frame_text, status))
 
     def _render_snapshot(self) -> None:
         snapshot = self.simulator.snapshot()

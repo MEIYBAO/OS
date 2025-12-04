@@ -7,7 +7,7 @@ from .models import Process
 class MemoryManager:
     """Simple paged memory manager with FIFO replacement."""
 
-    def __init__(self, frames: int = 8):
+    def __init__(self, frames: int = 20):
         self.frames = frames
         self.frame_table: List[Optional[Tuple[int, int]]] = [None for _ in range(frames)]
         self.replacement_queue: deque[int] = deque(range(frames))
