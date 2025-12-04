@@ -106,8 +106,14 @@ class SimulatorGUI:
         self.file_tree.column("size", width=90)
         self.file_tree.pack(fill=tk.X, padx=2, pady=(0, 8))
 
-        self.buffer_label = ttk.Label(right, text="生产者-消费者缓冲区: 0/0")
-        self.buffer_label.pack(anchor=tk.W, pady=(0, 4))
+        buffer_frame = ttk.LabelFrame(right, text="生产者-消费者缓冲池")
+        buffer_frame.pack(fill=tk.X, padx=2, pady=(0, 8))
+        ttk.Label(buffer_frame, text="生产者").pack(anchor=tk.W, padx=6, pady=(2, 0))
+        self.buffer_status = ttk.Label(buffer_frame, text="缓冲区: 0/0")
+        self.buffer_status.pack(anchor=tk.W, padx=6)
+        self.buffer_canvas = tk.Canvas(buffer_frame, height=120, background="#fafafa")
+        self.buffer_canvas.pack(fill=tk.X, padx=6, pady=4)
+        ttk.Label(buffer_frame, text="消费者").pack(anchor=tk.W, padx=6, pady=(0, 4))
 
         ttk.Label(right, text="事件日志 (动态过程)").pack(anchor=tk.W)
         self.log_area = scrolledtext.ScrolledText(right, height=18, state=tk.DISABLED)
@@ -229,6 +235,45 @@ class SimulatorGUI:
         for path, entry in snapshot["files"].items():
             self.file_tree.insert("", tk.END, text=path, values=(entry.owner, entry.size))
 
+    def _render_buffer(self, snapshot: dict) -> None:
+        buf = snapshot["buffer"]
+        capacity = buf["capacity"]
+        slots = buf["slots"]
+        used = buf["used"]
+        in_ptr = buf["in"]
+        out_ptr = buf["out"]
+        self.buffer_status.configure(text=f"缓冲区: {used}/{capacity}")
+
+        self.buffer_canvas.delete("all")
+        margin = 20
+        cell_w = 70
+        cell_h = 40
+        gap = 6
+        for idx in range(capacity):
+            x1 = margin + idx * (cell_w + gap)
+            y1 = 20
+            x2 = x1 + cell_w
+            y2 = y1 + cell_h
+            owner = slots[idx]
+            fill = "#fff" if owner is None else self._color_for_pid(owner)
+            self.buffer_canvas.create_rectangle(
+                x1, y1, x2, y2, fill=fill, outline="#555", width=2
+            )
+            label = f"P{owner}" if owner is not None else ""
+            self.buffer_canvas.create_text((x1 + x2) / 2, (y1 + y2) / 2, text=label)
+            self.buffer_canvas.create_text((x1 + x2) / 2, y1 - 10, text=str(idx))
+
+        def draw_arrow(position: int, color: str, text: str, dy: int) -> None:
+            x1 = margin + position * (cell_w + gap)
+            x2 = x1 + cell_w
+            mid_x = (x1 + x2) / 2
+            base_y = 20 + cell_h + dy
+            self.buffer_canvas.create_line(mid_x, base_y, mid_x, base_y - dy + 6, arrow=tk.LAST, fill=color, width=2)
+            self.buffer_canvas.create_text(mid_x, base_y + (8 if dy > 0 else -12), text=text, fill=color)
+
+        draw_arrow(in_ptr, "#d62728", "in", -20)
+        draw_arrow(out_ptr, "#1f77b4", "out", 34)
+
     def _render_logs(self, snapshot: dict) -> None:
         self.log_area.configure(state=tk.NORMAL)
         for line in snapshot["log"][self.last_log_len :]:
@@ -261,9 +306,8 @@ class SimulatorGUI:
         self._render_queues(snapshot)
         self._render_memory(snapshot)
         self._render_files(snapshot)
+        self._render_buffer(snapshot)
         self._render_logs(snapshot)
-        buf_used, buf_cap = snapshot["buffer"]
-        self.buffer_label.configure(text=f"生产者-消费者缓冲区: {buf_used}/{buf_cap}")
 
     def _run_loop(self) -> None:
         if not self.auto_running:

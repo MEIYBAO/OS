@@ -22,7 +22,10 @@ class OSSimulator:
         self.memory = MemoryManager(frames=20)
         self.file_system = FileSystem()
         self.event_log: List[str] = []
-        self.buffer_capacity = 3
+        self.buffer_capacity = 5
+        self.buffer_slots: List[Optional[int]] = [None] * self.buffer_capacity
+        self.buffer_in = 0
+        self.buffer_out = 0
         self.buffer_count = 0
         self.mutex_owner: Optional[int] = None
         self.shared_resources: Dict[str, int] = {"磁带机": 1, "GPU": 1, "打印机": 2}
@@ -65,19 +68,16 @@ class OSSimulator:
             ),
             Process(
                 pid=3,
-                name="数据库",
+                name="生产者C",
                 arrival_time=1,
-                memory_pages=5,
+                memory_pages=3,
                 actions=[
-                    ProcessAction("cpu", "接收查询"),
-                    ProcessAction("mem", "访问索引页", page=2),
-                    ProcessAction("file_read", "读取数据页", path="/data/users", size=2),
-                    ProcessAction("cpu", "计算聚合"),
-                    ProcessAction("res_acquire", "申请GPU并执行加速", resource="GPU"),
-                    ProcessAction("io", "等待磁盘", io_duration=1),
-                    ProcessAction("mem", "访问缓存页", page=3),
-                    ProcessAction("res_release", "释放GPU", resource="GPU"),
-                    ProcessAction("cpu", "返回结果"),
+                    ProcessAction("produce", "批量生产，补充库存"),
+                    ProcessAction("produce", "继续生产"),
+                    ProcessAction("mem", "更新生产统计", page=1),
+                    ProcessAction("produce", "再放入一件"),
+                    ProcessAction("cpu", "计算下一批计划"),
+                    ProcessAction("produce", "补齐缓冲，可能等待空位"),
                 ],
             ),
             Process(
@@ -100,7 +100,7 @@ class OSSimulator:
             ),
             Process(
                 pid=5,
-                name="消费者C",
+                name="消费者D",
                 arrival_time=2,
                 memory_pages=2,
                 actions=[
@@ -108,6 +108,23 @@ class OSSimulator:
                     ProcessAction("mem", "访问缓存页", page=1),
                     ProcessAction("consume", "继续消费清空缓冲"),
                     ProcessAction("consume", "再次消费"),
+                ],
+            ),
+            Process(
+                pid=6,
+                name="数据库",
+                arrival_time=2,
+                memory_pages=5,
+                actions=[
+                    ProcessAction("cpu", "接收查询"),
+                    ProcessAction("mem", "访问索引页", page=2),
+                    ProcessAction("file_read", "读取数据页", path="/data/users", size=2),
+                    ProcessAction("cpu", "计算聚合"),
+                    ProcessAction("res_acquire", "申请GPU并执行加速", resource="GPU"),
+                    ProcessAction("io", "等待磁盘", io_duration=1),
+                    ProcessAction("mem", "访问缓存页", page=3),
+                    ProcessAction("res_release", "释放GPU", resource="GPU"),
+                    ProcessAction("cpu", "返回结果"),
                 ],
             ),
         ]
@@ -144,6 +161,9 @@ class OSSimulator:
         self.memory.reset()
         self.file_system.reset()
         self.event_log.clear()
+        self.buffer_slots = [None] * self.buffer_capacity
+        self.buffer_in = 0
+        self.buffer_out = 0
         self.buffer_count = 0
         self.mutex_owner = None
         self.next_pid = len(self.templates) + 1
@@ -286,18 +306,26 @@ class OSSimulator:
                 self._release_mutex(proc)
                 self._block_reason(proc, "等待空槽")
                 return
+            self.buffer_slots[self.buffer_in] = proc.pid
+            slot = self.buffer_in
+            self.buffer_in = (self.buffer_in + 1) % self.buffer_capacity
             self.buffer_count += 1
             self._log(
-                f"进程 {proc.pid} 生产 1 件产品，缓冲区 {self.buffer_count}/{self.buffer_capacity}。"
+                f"进程 {proc.pid} 生产 1 件产品放入槽位 {slot}，缓冲区 {self.buffer_count}/{self.buffer_capacity}。",
             )
         elif action.kind == "consume":
             if self.buffer_count <= 0:
                 self._release_mutex(proc)
                 self._block_reason(proc, "等待产品")
                 return
+            owner = self.buffer_slots[self.buffer_out]
+            slot = self.buffer_out
+            self.buffer_slots[self.buffer_out] = None
+            self.buffer_out = (self.buffer_out + 1) % self.buffer_capacity
             self.buffer_count -= 1
+            who = f"(来自P{owner})" if owner is not None else ""
             self._log(
-                f"进程 {proc.pid} 消费 1 件产品，缓冲区 {self.buffer_count}/{self.buffer_capacity}。"
+                f"进程 {proc.pid} 消费槽位 {slot} 的产品{who}，缓冲区 {self.buffer_count}/{self.buffer_capacity}。",
             )
         self._release_mutex(proc)
 
@@ -399,6 +427,12 @@ class OSSimulator:
                 for pid, proc in self.process_pool.items()
             },
             "files": self.file_system.files,
-            "buffer": (self.buffer_count, self.buffer_capacity),
+            "buffer": {
+                "used": self.buffer_count,
+                "capacity": self.buffer_capacity,
+                "slots": list(self.buffer_slots),
+                "in": self.buffer_in,
+                "out": self.buffer_out,
+            },
             "log": list(self.event_log),
         }
