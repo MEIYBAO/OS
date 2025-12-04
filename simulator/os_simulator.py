@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from typing import Deque, Dict, List, Optional
+from typing import Deque, Dict, List, Optional, Tuple
 
 from .filesystem import FileSystem
 from .memory import MemoryManager
@@ -15,13 +15,17 @@ class OSSimulator:
         self.time_quantum = time_quantum
         self.clock: int = 0
         self.process_pool: Dict[int, Process] = {}
-        self.ready_queue: Deque[Process] = deque()
+        self.ready_queues: List[Deque[Process]] = [deque(), deque(), deque()]
         self.blocked: List[Process] = []
         self.finished: List[Process] = []
         self.running: Optional[Process] = None
         self.memory = MemoryManager(frames=8)
         self.file_system = FileSystem()
         self.event_log: List[str] = []
+        self.buffer_capacity = 4
+        self.buffer_count = 0
+        self.mutex_owner: Optional[int] = None
+        self.queue_quantums = [1, 2, 4]
         self.templates = self._default_templates()
 
     def _default_templates(self) -> List[Process]:
@@ -29,24 +33,33 @@ class OSSimulator:
         return [
             Process(
                 pid=1,
-                name="编译任务",
+                name="生产者A",
                 arrival_time=0,
-                memory_pages=6,
+                memory_pages=3,
                 actions=[
-                    ProcessAction("cpu", "编译器装载"),
-                    ProcessAction("mem", "访问代码段", page=0),
-                    ProcessAction("mem", "访问数据段", page=1),
-                    ProcessAction("file_create", "生成中间文件", path="/build/tmp.o", size=4),
-                    ProcessAction("cpu", "语法分析"),
-                    ProcessAction("io", "等待磁盘写入", io_duration=2),
-                    ProcessAction("mem", "访问新的代码页", page=4),
-                    ProcessAction("cpu", "指令优化"),
-                    ProcessAction("file_write", "写入目标文件", path="/build/app", size=6),
-                    ProcessAction("cpu", "收尾"),
+                    ProcessAction("produce", "申请互斥并生产一件产品"),
+                    ProcessAction("mem", "访问代码页", page=0),
+                    ProcessAction("produce", "继续生产填充缓冲区"),
+                    ProcessAction("produce", "生产更多数据"),
+                    ProcessAction("cpu", "计算校验码"),
+                    ProcessAction("produce", "尝试再放入一件"),
                 ],
             ),
             Process(
                 pid=2,
+                name="消费者B",
+                arrival_time=0,
+                memory_pages=3,
+                actions=[
+                    ProcessAction("consume", "申请互斥并消费一件产品"),
+                    ProcessAction("mem", "访问数据页", page=1),
+                    ProcessAction("consume", "继续消费"),
+                    ProcessAction("io", "输出结果", io_duration=1),
+                    ProcessAction("consume", "再次消费"),
+                ],
+            ),
+            Process(
+                pid=3,
                 name="数据库",
                 arrival_time=1,
                 memory_pages=5,
@@ -61,7 +74,7 @@ class OSSimulator:
                 ],
             ),
             Process(
-                pid=3,
+                pid=4,
                 name="备份程序",
                 arrival_time=3,
                 memory_pages=4,
@@ -81,13 +94,16 @@ class OSSimulator:
     def reset(self) -> None:
         self.clock = 0
         self.process_pool = {proc.pid: self._clone_process(proc) for proc in self.templates}
-        self.ready_queue.clear()
+        for q in self.ready_queues:
+            q.clear()
         self.blocked.clear()
         self.finished.clear()
         self.running = None
         self.memory.reset()
         self.file_system.reset()
         self.event_log.clear()
+        self.buffer_count = 0
+        self.mutex_owner = None
 
     def _clone_process(self, template: Process) -> Process:
         return Process(
@@ -102,18 +118,36 @@ class OSSimulator:
         self.event_log.append(f"[t={self.clock}] {message}")
 
     def _dispatch_if_needed(self) -> None:
-        if self.running is None and self.ready_queue:
-            self.running = self.ready_queue.popleft()
-            self.running.state = "Running"
-            self.running.reset_runtime()
-            self._log(f"调度进程 {self.running.pid} ({self.running.name}) 运行。")
+        if self.running is None:
+            for level, queue in enumerate(self.ready_queues):
+                if queue:
+                    self.running = queue.popleft()
+                    self.running.state = "Running"
+                    self.running.reset_runtime()
+                    self.running.queue_level = level
+                    self._log(
+                        f"调度进程 {self.running.pid} 进入CPU（队列Q{level}, 时间片 {self.queue_quantums[level]}）。"
+                    )
+                    break
 
     def _handle_blocked(self) -> None:
-        newly_ready = [p for p in self.blocked if p.tick_block()]
+        newly_ready: List[Tuple[Process, str]] = []
+        for proc in list(self.blocked):
+            if proc.wait_reason:
+                if self._can_wake_from_wait(proc):
+                    reason = proc.wait_reason
+                    proc.ready_from_wait()
+                    newly_ready.append((proc, reason))
+            elif proc.tick_block():
+                newly_ready.append((proc, ""))
         self.blocked = [p for p in self.blocked if p.state == "Blocked"]
-        for proc in newly_ready:
-            self.ready_queue.append(proc)
-            self._log(f"进程 {proc.pid} I/O 完成，重新进入就绪队列。")
+        for proc, reason in newly_ready:
+            proc.queue_level = 0
+            self.ready_queues[proc.queue_level].append(proc)
+            if reason:
+                self._log(f"进程 {proc.pid} 获得{reason}，回到高优先级队列。")
+            else:
+                self._log(f"进程 {proc.pid} I/O 完成，重新进入高优先级队列。")
 
     def _complete_process(self, proc: Process) -> None:
         proc.finish()
@@ -124,8 +158,9 @@ class OSSimulator:
     def _preempt(self, proc: Process) -> None:
         proc.state = "Ready"
         proc.current_quantum = 0
-        self.ready_queue.append(proc)
-        self._log(f"进程 {proc.pid} 时间片用完，被重新排入就绪队列。")
+        proc.queue_level = min(proc.queue_level + 1, len(self.ready_queues) - 1)
+        self.ready_queues[proc.queue_level].append(proc)
+        self._log(f"进程 {proc.pid} 时间片用完，降到队列 Q{proc.queue_level}。")
         self.running = None
 
     def _block(self, proc: Process, duration: int) -> None:
@@ -133,6 +168,21 @@ class OSSimulator:
         self.blocked.append(proc)
         self._log(f"进程 {proc.pid} 阻塞，等待 {duration} 个时间片。")
         self.running = None
+
+    def _block_reason(self, proc: Process, reason: str) -> None:
+        proc.mark_wait(reason)
+        self.blocked.append(proc)
+        self._log(f"进程 {proc.pid} 因 {reason} 阻塞，等待资源。")
+        self.running = None
+
+    def _can_wake_from_wait(self, proc: Process) -> bool:
+        if proc.wait_reason == "等待空槽":
+            return self.buffer_count < self.buffer_capacity
+        if proc.wait_reason == "等待产品":
+            return self.buffer_count > 0
+        if proc.wait_reason == "等待互斥锁":
+            return self.mutex_owner is None
+        return False
 
     def _execute_memory(self, proc: Process, action: ProcessAction) -> None:
         fault, frame, evicted = self.memory.access_page(proc, action.page or 0)
@@ -148,6 +198,42 @@ class OSSimulator:
             )
         else:
             self._log(f"进程 {proc.pid} 命中物理帧 {frame}。")
+
+    def _with_mutex(self, proc: Process) -> bool:
+        if self.mutex_owner is None:
+            self.mutex_owner = proc.pid
+            return True
+        if self.mutex_owner == proc.pid:
+            return True
+        self._block_reason(proc, "等待互斥锁")
+        return False
+
+    def _release_mutex(self, proc: Process) -> None:
+        if self.mutex_owner == proc.pid:
+            self.mutex_owner = None
+
+    def _execute_pc_action(self, proc: Process, action: ProcessAction) -> None:
+        if not self._with_mutex(proc):
+            return
+        if action.kind == "produce":
+            if self.buffer_count >= self.buffer_capacity:
+                self._release_mutex(proc)
+                self._block_reason(proc, "等待空槽")
+                return
+            self.buffer_count += 1
+            self._log(
+                f"进程 {proc.pid} 生产 1 件产品，缓冲区 {self.buffer_count}/{self.buffer_capacity}。"
+            )
+        elif action.kind == "consume":
+            if self.buffer_count <= 0:
+                self._release_mutex(proc)
+                self._block_reason(proc, "等待产品")
+                return
+            self.buffer_count -= 1
+            self._log(
+                f"进程 {proc.pid} 消费 1 件产品，缓冲区 {self.buffer_count}/{self.buffer_capacity}。"
+            )
+        self._release_mutex(proc)
 
     def _execute_file_action(self, proc: Process, action: ProcessAction) -> None:
         if action.kind == "file_create":
@@ -177,6 +263,10 @@ class OSSimulator:
             return
         elif action.kind == "mem":
             self._execute_memory(proc, action)
+        elif action.kind in {"produce", "consume"}:
+            self._execute_pc_action(proc, action)
+            if proc.state == "Blocked":
+                return
         elif action.kind.startswith("file"):
             self._execute_file_action(proc, action)
         else:
@@ -188,7 +278,7 @@ class OSSimulator:
             return
 
         proc.current_quantum += 1
-        if proc.current_quantum >= self.time_quantum:
+        if proc.current_quantum >= self.queue_quantums[proc.queue_level]:
             self._preempt(proc)
 
     def step(self) -> None:
@@ -198,8 +288,9 @@ class OSSimulator:
         for proc in list(self.process_pool.values()):
             if proc.state == "New" and proc.arrival_time <= self.clock:
                 proc.state = "Ready"
-                self.ready_queue.append(proc)
-                self._log(f"新进程 {proc.pid} ({proc.name}) 到达并进入就绪队列。")
+                proc.queue_level = 0
+                self.ready_queues[0].append(proc)
+                self._log(f"新进程 {proc.pid} ({proc.name}) 到达并进入就绪队列 Q0。")
 
         self._handle_blocked()
         self._dispatch_if_needed()
@@ -212,11 +303,13 @@ class OSSimulator:
         return {
             "clock": self.clock,
             "running": self.running,
-            "ready": list(self.ready_queue),
+            "ready": [list(q) for q in self.ready_queues],
             "blocked": list(self.blocked),
             "finished": list(self.finished),
             "frames": self.memory.frame_table,
             "last_access": self.memory.last_access,
+            "page_tables": {pid: proc.page_table for pid, proc in self.process_pool.items()},
             "files": self.file_system.files,
-            "log": list(self.event_log[-8:]),
+            "buffer": (self.buffer_count, self.buffer_capacity),
+            "log": list(self.event_log[-12:]),
         }

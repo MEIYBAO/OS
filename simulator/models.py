@@ -25,6 +25,8 @@ class Process:
     pointer: int = 0
     current_quantum: int = 0
     io_timer: int = 0
+    queue_level: int = 0
+    wait_reason: str = ""
     page_table: dict = field(default_factory=dict)
 
     def next_action(self) -> Optional[ProcessAction]:
@@ -43,14 +45,25 @@ class Process:
         self.state = "Blocked"
         self.io_timer = duration
         self.current_quantum = 0
+        self.wait_reason = ""
+
+    def mark_wait(self, reason: str) -> None:
+        self.state = "Blocked"
+        self.wait_reason = reason
+        self.current_quantum = 0
 
     def tick_block(self) -> bool:
         if self.io_timer > 0:
             self.io_timer -= 1
         if self.io_timer == 0:
-            self.state = "Ready"
-            return True
+            if not self.wait_reason:
+                self.state = "Ready"
+                return True
         return False
+
+    def ready_from_wait(self) -> None:
+        self.wait_reason = ""
+        self.state = "Ready"
 
     def finish(self) -> None:
         self.state = "Finished"
