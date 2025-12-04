@@ -11,6 +11,8 @@ class SimulatorGUI:
         self.simulator = OSSimulator(time_quantum=2)
         self.simulator.reset()
         self.auto_running = False
+        self.selected_pid: int | None = None
+        self.last_log_len = 0
 
         self._build_layout()
         self._render_snapshot()
@@ -52,6 +54,7 @@ class SimulatorGUI:
         self.process_tree.column("queue", width=60)
         ttk.Label(left, text="进程管理 / 调度").pack(anchor=tk.W)
         self.process_tree.pack(fill=tk.BOTH, expand=True)
+        self.process_tree.bind("<<TreeviewSelect>>", self._on_select_process)
 
         queue_frame = ttk.LabelFrame(left, text="多级反馈队列 (Q0/Q1/Q2)")
         queue_frame.pack(fill=tk.X, pady=(4, 4))
@@ -169,10 +172,7 @@ class SimulatorGUI:
             if 0 <= snapshot["last_access"] < len(children):
                 self.memory_tree.selection_set(children[snapshot["last_access"]])
 
-        self._clear_tree(self.page_table_tree)
-        for pid, table in snapshot["page_tables"].items():
-            for page, frame in sorted(table.items()):
-                self.page_table_tree.insert("", tk.END, values=(pid, page, frame))
+        self._render_page_table(snapshot)
 
     def _render_files(self, snapshot: dict) -> None:
         self._clear_tree(self.file_tree)
@@ -181,11 +181,22 @@ class SimulatorGUI:
 
     def _render_logs(self, snapshot: dict) -> None:
         self.log_area.configure(state=tk.NORMAL)
-        self.log_area.delete(1.0, tk.END)
-        for line in snapshot["log"]:
+        for line in snapshot["log"][self.last_log_len :]:
             self.log_area.insert(tk.END, line + "\n")
+        self.last_log_len = len(snapshot["log"])
         self.log_area.configure(state=tk.DISABLED)
         self.log_area.yview_moveto(1.0)
+
+    def _render_page_table(self, snapshot: dict) -> None:
+        self._clear_tree(self.page_table_tree)
+        pid = self.selected_pid
+        if pid is None and snapshot["running"]:
+            pid = snapshot["running"].pid
+        if pid is None:
+            return
+        table = snapshot["page_tables"].get(pid, {})
+        for page, frame in sorted(table.items()):
+            self.page_table_tree.insert("", tk.END, values=(pid, page, frame))
 
     def _render_snapshot(self) -> None:
         snapshot = self.simulator.snapshot()
@@ -218,6 +229,23 @@ class SimulatorGUI:
         self.simulator.reset()
         self.auto_running = False
         self.auto_btn.configure(text="自动运行")
+        self.selected_pid = None
+        self.last_log_len = 0
+        self._render_snapshot()
+
+    def _on_select_process(self, event: tk.Event) -> None:
+        selection = self.process_tree.selection()
+        if not selection:
+            return
+        item = selection[0]
+        values = self.process_tree.item(item, "values")
+        if not values:
+            return
+        name = values[0]
+        try:
+            self.selected_pid = int(name.split("-")[0])
+        except ValueError:
+            self.selected_pid = None
         self._render_snapshot()
 
 

@@ -22,11 +22,14 @@ class OSSimulator:
         self.memory = MemoryManager(frames=8)
         self.file_system = FileSystem()
         self.event_log: List[str] = []
-        self.buffer_capacity = 4
+        self.buffer_capacity = 3
         self.buffer_count = 0
         self.mutex_owner: Optional[int] = None
+        self.shared_resources: Dict[str, int] = {"磁带机": 1, "GPU": 1, "打印机": 2}
         self.queue_quantums = [1, 2, 4]
         self.templates = self._default_templates()
+        self.dynamic_templates = self._dynamic_templates()
+        self.next_pid = len(self.templates) + 1
 
     def _default_templates(self) -> List[Process]:
         """Predefined scripts to show OS concepts deterministically."""
@@ -43,6 +46,7 @@ class OSSimulator:
                     ProcessAction("produce", "生产更多数据"),
                     ProcessAction("cpu", "计算校验码"),
                     ProcessAction("produce", "尝试再放入一件"),
+                    ProcessAction("produce", "再次填充，可能触发满等待"),
                 ],
             ),
             Process(
@@ -56,6 +60,7 @@ class OSSimulator:
                     ProcessAction("consume", "继续消费"),
                     ProcessAction("io", "输出结果", io_duration=1),
                     ProcessAction("consume", "再次消费"),
+                    ProcessAction("consume", "直到缓冲区空，可能阻塞"),
                 ],
             ),
             Process(
@@ -68,8 +73,10 @@ class OSSimulator:
                     ProcessAction("mem", "访问索引页", page=2),
                     ProcessAction("file_read", "读取数据页", path="/data/users", size=2),
                     ProcessAction("cpu", "计算聚合"),
+                    ProcessAction("res_acquire", "申请GPU并执行加速", resource="GPU"),
                     ProcessAction("io", "等待磁盘", io_duration=1),
                     ProcessAction("mem", "访问缓存页", page=3),
+                    ProcessAction("res_release", "释放GPU", resource="GPU"),
                     ProcessAction("cpu", "返回结果"),
                 ],
             ),
@@ -86,9 +93,44 @@ class OSSimulator:
                     ProcessAction("io", "写入磁盘", io_duration=2),
                     ProcessAction("mem", "校验页", page=2),
                     ProcessAction("file_delete", "删除旧镜像", path="/backup/old"),
+                    ProcessAction("res_acquire", "占用磁带机写出", resource="磁带机"),
                     ProcessAction("cpu", "收尾"),
+                    ProcessAction("res_release", "释放磁带机", resource="磁带机"),
                 ],
             ),
+            Process(
+                pid=5,
+                name="消费者C",
+                arrival_time=2,
+                memory_pages=2,
+                actions=[
+                    ProcessAction("consume", "尝试消费产品，可能等待"),
+                    ProcessAction("mem", "访问缓存页", page=1),
+                    ProcessAction("consume", "继续消费清空缓冲"),
+                    ProcessAction("consume", "再次消费"),
+                ],
+            ),
+        ]
+
+    def _dynamic_templates(self) -> List[List[ProcessAction]]:
+        return [
+            [
+                ProcessAction("cpu", "短作业计算"),
+                ProcessAction("mem", "访存页", page=0),
+                ProcessAction("cpu", "快速结束"),
+            ],
+            [
+                ProcessAction("res_acquire", "申请打印机生成报表", resource="打印机"),
+                ProcessAction("cpu", "格式化报表"),
+                ProcessAction("mem", "加载模板页", page=2),
+                ProcessAction("res_release", "释放打印机", resource="打印机"),
+            ],
+            [
+                ProcessAction("mem", "预取代码页", page=1),
+                ProcessAction("io", "等待网络", io_duration=1),
+                ProcessAction("file_read", "读取配置", path="/etc/conf", size=1),
+                ProcessAction("cpu", "处理请求"),
+            ],
         ]
 
     def reset(self) -> None:
@@ -104,6 +146,7 @@ class OSSimulator:
         self.event_log.clear()
         self.buffer_count = 0
         self.mutex_owner = None
+        self.next_pid = len(self.templates) + 1
 
     def _clone_process(self, template: Process) -> Process:
         return Process(
@@ -116,6 +159,26 @@ class OSSimulator:
 
     def _log(self, message: str) -> None:
         self.event_log.append(f"[t={self.clock}] {message}")
+
+    def _spawn_dynamic_job(self) -> None:
+        index = (self.clock // 3) % len(self.dynamic_templates)
+        actions = [
+            ProcessAction(a.kind, a.description, a.page, a.path, a.size, a.io_duration, a.resource)
+            for a in self.dynamic_templates[index]
+        ]
+        proc = Process(
+            pid=self.next_pid,
+            name=f"新作业{self.next_pid}",
+            arrival_time=self.clock,
+            memory_pages=3,
+            actions=actions,
+        )
+        self.process_pool[proc.pid] = proc
+        self.next_pid += 1
+        proc.state = "Ready"
+        proc.queue_level = 0
+        self.ready_queues[0].append(proc)
+        self._log(f"自动生成新进程 {proc.pid} 插入就绪队列，保持持续负载。")
 
     def _dispatch_if_needed(self) -> None:
         if self.running is None:
@@ -182,6 +245,9 @@ class OSSimulator:
             return self.buffer_count > 0
         if proc.wait_reason == "等待互斥锁":
             return self.mutex_owner is None
+        if proc.wait_reason.startswith("等待资源"):
+            resource = proc.wait_reason.replace("等待资源", "")
+            return self.shared_resources.get(resource, 0) > 0
         return False
 
     def _execute_memory(self, proc: Process, action: ProcessAction) -> None:
@@ -235,6 +301,18 @@ class OSSimulator:
             )
         self._release_mutex(proc)
 
+    def _execute_resource_action(self, proc: Process, action: ProcessAction) -> None:
+        resource = action.resource or "未知资源"
+        if action.kind == "res_acquire":
+            if self.shared_resources.get(resource, 0) <= 0:
+                self._block_reason(proc, f"等待资源{resource}")
+                return
+            self.shared_resources[resource] -= 1
+            self._log(f"进程 {proc.pid} 获取资源 {resource}，剩余 {self.shared_resources[resource]}。")
+        else:
+            self.shared_resources[resource] = self.shared_resources.get(resource, 0) + 1
+            self._log(f"进程 {proc.pid} 释放资源 {resource}，可用 {self.shared_resources[resource]}。")
+
     def _execute_file_action(self, proc: Process, action: ProcessAction) -> None:
         if action.kind == "file_create":
             message = self.file_system.create(action.path or "", proc.pid, size=action.size or 0)
@@ -269,6 +347,10 @@ class OSSimulator:
                 return
         elif action.kind.startswith("file"):
             self._execute_file_action(proc, action)
+        elif action.kind.startswith("res_"):
+            self._execute_resource_action(proc, action)
+            if proc.state == "Blocked":
+                return
         else:
             self._log(f"进程 {proc.pid} 执行未知操作 {action.kind}")
 
@@ -299,6 +381,9 @@ class OSSimulator:
         else:
             self._log("处理器空闲。")
 
+        if self.clock % 4 == 0:
+            self._spawn_dynamic_job()
+
     def snapshot(self) -> Dict[str, object]:
         return {
             "clock": self.clock,
@@ -311,5 +396,5 @@ class OSSimulator:
             "page_tables": {pid: proc.page_table for pid, proc in self.process_pool.items()},
             "files": self.file_system.files,
             "buffer": (self.buffer_count, self.buffer_capacity),
-            "log": list(self.event_log[-12:]),
+            "log": list(self.event_log),
         }

@@ -12,6 +12,7 @@ class ProcessAction:
     path: Optional[str] = None
     size: Optional[int] = None
     io_duration: int = 0
+    resource: Optional[str] = None
 
 
 @dataclass
